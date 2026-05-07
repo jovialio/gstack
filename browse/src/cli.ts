@@ -13,6 +13,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { safeUnlink, safeUnlinkQuiet, safeKill, isProcessAlive } from './error-handling';
 import { resolveConfig, ensureStateDir, readVersionHash } from './config';
+import { parseProxyConfig, computeConfigHash, ProxyConfigError } from './proxy-config';
+import { redactProxyUrl } from './proxy-redact';
 
 const config = resolveConfig();
 const IS_WINDOWS = process.platform === 'win32';
@@ -92,6 +94,12 @@ interface ServerState {
   serverPath: string;
   binaryVersion?: string;
   mode?: 'launched' | 'headed';
+  /** Hash of (proxyUrl + headed flag), used by D2 daemon-mismatch check. */
+  configHash?: string;
+  /** Xvfb child PID for cleanup on disconnect. */
+  xvfbPid?: number;
+  xvfbStartTime?: number;
+  xvfbDisplay?: string;
 }
 
 // ─── State File ────────────────────────────────────────────────
@@ -305,19 +313,43 @@ function acquireServerLock(): (() => void) | null {
   }
 }
 
-async function ensureServer(): Promise<ServerState> {
+async function ensureServer(flags?: GlobalFlags): Promise<ServerState> {
   const state = readState();
+  const desiredHash = flags?.configHash;
+  const extraEnv: Record<string, string> = {};
+  if (flags?.proxyUrl) extraEnv.BROWSE_PROXY_URL = flags.proxyUrl;
+  if (flags?.headed) extraEnv.BROWSE_HEADED = '1';
+  if (desiredHash) extraEnv.BROWSE_CONFIG_HASH = desiredHash;
 
   // Health-check-first: HTTP is definitive proof the server is alive and responsive.
   // This replaces the PID-gated approach which breaks on Windows (Bun's process.kill
   // always throws ESRCH for Windows PIDs in compiled binaries).
   if (state && await isServerHealthy(state.port)) {
+    // D2 daemon-mismatch check: existing daemon's configHash must match the
+    // CLI's resolved hash. If --proxy or --headed are passed and the existing
+    // daemon was started with different config, refuse with a `disconnect`
+    // hint. No silent restart — that would drop tab state, cookies, and
+    // logged-in sessions without warning.
+    if (desiredHash && state.configHash && state.configHash !== desiredHash) {
+      console.error(`[browse] existing daemon has different config (proxy/headed mismatch).`);
+      console.error(`[browse] run 'browse disconnect' first to apply --proxy/--headed.`);
+      process.exit(1);
+    }
+    // Same path: existing daemon is plain (no flags) but caller passes
+    // --proxy/--headed. Refuse for the same reason — apply explicitly via
+    // disconnect+reconnect.
+    if (desiredHash && !state.configHash && (flags?.proxyUrl || flags?.headed)) {
+      console.error(`[browse] existing daemon was started without --proxy/--headed.`);
+      console.error(`[browse] run 'browse disconnect' first to apply new flags.`);
+      process.exit(1);
+    }
+
     // Check for binary version mismatch (auto-restart on update)
     const currentVersion = readVersionHash();
     if (currentVersion && state.binaryVersion && currentVersion !== state.binaryVersion) {
       console.error('[browse] Binary updated, restarting server...');
       await killServer(state.pid);
-      return startServer();
+      return startServer(extraEnv);
     }
     return state;
   }
@@ -368,8 +400,14 @@ async function ensureServer(): Promise<ServerState> {
     if (state && state.pid) {
       await killServer(state.pid);
     }
-    console.error('[browse] Starting server...');
-    return await startServer();
+    if (flags?.redactedProxyUrl && flags.redactedProxyUrl !== '<no proxy>') {
+      console.error(`[browse] Starting server with proxy ${flags.redactedProxyUrl}${flags.headed ? ' (headed)' : ''}...`);
+    } else if (flags?.headed) {
+      console.error('[browse] Starting server in headed mode...');
+    } else {
+      console.error('[browse] Starting server...');
+    }
+    return await startServer(extraEnv);
   } finally {
     releaseLock();
   }
@@ -608,6 +646,78 @@ function hasFlag(args: string[], flag: string): boolean {
   return args.includes(flag);
 }
 
+export interface GlobalFlags {
+  /** Cleaned argv with --proxy/--headed stripped out. */
+  args: string[];
+  /** Resolved BROWSE_PROXY_URL (with creds embedded) or null. */
+  proxyUrl: string | null;
+  /** Whether --headed was passed. */
+  headed: boolean;
+  /** Hash of (proxy + headed) for daemon-mismatch check. */
+  configHash: string;
+  /** Redacted form of proxyUrl, safe for logs. */
+  redactedProxyUrl: string;
+}
+
+/**
+ * Strip the global --proxy and --headed flags from args, validate cred policy,
+ * and return the resolved config. Exits 1 with a clear hint on policy
+ * violations (D9 cred mixing, malformed URL, unsupported scheme).
+ *
+ * Exported for unit tests.
+ */
+export function extractGlobalFlags(rawArgs: string[], env: NodeJS.ProcessEnv): GlobalFlags {
+  const out: string[] = [];
+  let proxyUrl: string | null = null;
+  let headed = false;
+
+  for (let i = 0; i < rawArgs.length; i++) {
+    const arg = rawArgs[i];
+    if (arg === '--proxy') {
+      const value = rawArgs[i + 1];
+      if (!value) {
+        throw new ProxyConfigError(
+          'usage: --proxy <scheme://[user:pass@]host:port>',
+          '--proxy requires a URL value',
+        );
+      }
+      proxyUrl = value;
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--proxy=')) {
+      proxyUrl = arg.slice('--proxy='.length);
+      continue;
+    }
+    if (arg === '--headed') { headed = true; continue; }
+    out.push(arg);
+  }
+
+  // Compose the canonical proxyUrl with creds resolved from argv+env.
+  let canonicalProxyUrl: string | null = null;
+  if (proxyUrl) {
+    const parsed = parseProxyConfig({
+      proxyUrl,
+      envUser: env.BROWSE_PROXY_USER,
+      envPass: env.BROWSE_PROXY_PASS,
+    });
+    // Re-encode with resolved creds embedded (server reads BROWSE_PROXY_URL
+    // from env — env passes to child process safely without ps-aux exposure).
+    const rebuilt = new URL(proxyUrl);
+    rebuilt.username = parsed.userId ? encodeURIComponent(parsed.userId) : '';
+    rebuilt.password = parsed.password ? encodeURIComponent(parsed.password) : '';
+    canonicalProxyUrl = rebuilt.toString();
+  }
+
+  return {
+    args: out,
+    proxyUrl: canonicalProxyUrl,
+    headed,
+    configHash: computeConfigHash({ proxyUrl: canonicalProxyUrl, headed }),
+    redactedProxyUrl: redactProxyUrl(canonicalProxyUrl),
+  };
+}
+
 async function handlePairAgent(state: ServerState, args: string[]): Promise<void> {
   const clientName = parseFlag(args, '--client') || `remote-${Date.now()}`;
   const domains = parseFlag(args, '--domain')?.split(',').map(d => d.trim());
@@ -751,7 +861,23 @@ async function handlePairAgent(state: ServerState, args: string[]): Promise<void
 
 // ─── Main ──────────────────────────────────────────────────────
 async function main() {
-  const args = process.argv.slice(2);
+  const rawArgs = process.argv.slice(2);
+
+  // ─── Global flags (--proxy, --headed) ───────────────────────
+  // Extract before command dispatch so they apply to any command. Throws
+  // ProxyConfigError on invalid URL or D9 cred-mixing violations.
+  let globalFlags: GlobalFlags;
+  try {
+    globalFlags = extractGlobalFlags(rawArgs, process.env);
+  } catch (err) {
+    if (err instanceof ProxyConfigError) {
+      console.error(`[browse] error: ${err.message}`);
+      console.error(`[browse] hint: ${err.hint}`);
+      process.exit(1);
+    }
+    throw err;
+  }
+  const args = globalFlags.args;
 
   if (args.length === 0 || args[0] === '--help' || args[0] === '-h') {
     console.log(`gstack browse — Fast headless browser for AI coding agents
@@ -978,7 +1104,7 @@ Refs:           After 'snapshot', use @e1, @e2... as selectors:
     commandArgs.push(stdin.trim());
   }
 
-  let state = await ensureServer();
+  let state = await ensureServer(globalFlags);
 
   // ─── Pair-Agent (post-server, pre-dispatch) ──────────────
   if (command === 'pair-agent') {
