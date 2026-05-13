@@ -186,24 +186,35 @@ export function resolveChromiumProfile(explicit?: string): string {
  * ProcessSingleton refuses to start when these exist from a prior crash
  * (SIGKILL, hard crash, etc.) since they point at a PID that no longer exists.
  *
- * Defensive guard: refuses to operate unless the directory basename is
- * 'chromium-profile' OR the path matches the explicit CHROMIUM_PROFILE env
- * value. Prevents accidentally deleting lock files from an unrelated
- * directory if profile resolution is misconfigured upstream.
+ * Defensive guard: refuses to operate unless ALL of these hold:
+ *   1. `userDataDir` is an absolute path (no CWD-relative footguns)
+ *   2. basename is exactly 'chromium-profile' OR the absolute path matches
+ *      the absolute form of $CHROMIUM_PROFILE env value
+ *
+ * Prevents accidentally deleting lock files from an unrelated directory if
+ * profile resolution is misconfigured upstream (CWD drift, env injection).
  *
  * Caller MUST ensure external coordination has already guaranteed no live
  * peer is using this profile (gbd.lock for gbrowser; single-instance CLI
  * check for gstack).
  */
 export function cleanSingletonLocks(userDataDir: string): void {
-  const basename = path.basename(userDataDir);
+  if (!path.isAbsolute(userDataDir)) {
+    console.warn(`[browse] cleanSingletonLocks: refusing relative path: ${userDataDir}`);
+    return;
+  }
+  const resolved = path.resolve(userDataDir);
+  const basename = path.basename(resolved);
   const explicitProfile = process.env.CHROMIUM_PROFILE;
-  const isSafe = basename === 'chromium-profile' || userDataDir === explicitProfile;
+  const explicitAbs = explicitProfile && path.isAbsolute(explicitProfile)
+    ? path.resolve(explicitProfile)
+    : null;
+  const isSafe = basename === 'chromium-profile' || (explicitAbs !== null && resolved === explicitAbs);
   if (!isSafe) {
-    console.warn(`[browse] cleanSingletonLocks: refusing to clean unrecognized profile dir: ${userDataDir}`);
+    console.warn(`[browse] cleanSingletonLocks: refusing to clean unrecognized profile dir: ${resolved}`);
     return;
   }
   for (const lockFile of ['SingletonLock', 'SingletonSocket', 'SingletonCookie']) {
-    safeUnlinkQuiet(path.join(userDataDir, lockFile));
+    safeUnlinkQuiet(path.join(resolved, lockFile));
   }
 }

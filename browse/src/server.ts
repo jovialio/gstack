@@ -67,9 +67,21 @@ initAuditLog(config.auditLog);
 // ─── Auth ───────────────────────────────────────────────────────
 // AUTH_TOKEN is injectable via process.env.AUTH_TOKEN so embedders
 // (gbrowser's gbd daemon spawn) can pre-allocate the token and hand it to
-// the Bun child via env. Whitespace-only values fall back to randomUUID so
-// the security boundary is never silently weakened by misconfiguration.
-const AUTH_TOKEN = (process.env.AUTH_TOKEN?.trim()) || crypto.randomUUID();
+// the Bun child via env.
+//
+// Validation: require >= 16 chars after stripping ALL unicode whitespace
+// (not just ASCII — .trim() misses U+200B / U+FEFF / U+00A0 / etc., which
+// would otherwise let a misconfigured embedder ship a one-character BOM as
+// the bearer secret). Reject tokens that are too short or contain only
+// whitespace; fall back to randomUUID so the security boundary is never
+// silently weakened by misconfiguration.
+function sanitizeAuthToken(raw: string | undefined): string | null {
+  if (!raw) return null;
+  const stripped = raw.replace(/[\s ​-‍﻿]/g, '');
+  if (stripped.length < 16) return null;
+  return stripped;
+}
+const AUTH_TOKEN = sanitizeAuthToken(process.env.AUTH_TOKEN) || crypto.randomUUID();
 initRegistry(AUTH_TOKEN);
 const BROWSE_PORT = parseInt(process.env.BROWSE_PORT || '0', 10);
 const IDLE_TIMEOUT_MS = parseInt(process.env.BROWSE_IDLE_TIMEOUT || '1800000', 10); // 30 min
@@ -178,7 +190,10 @@ export function resolveConfigFromEnv(): Omit<ServerConfig, 'browserManager' | 's
   config: ReturnType<typeof resolveConfig>;
 } {
   return {
-    authToken: (process.env.AUTH_TOKEN?.trim()) || crypto.randomUUID(),
+    // Same sanitizer as the module-level AUTH_TOKEN: strips ALL unicode
+    // whitespace and rejects tokens shorter than 16 chars so a misconfigured
+    // embedder can't ship a BOM/zero-width as the bearer secret.
+    authToken: sanitizeAuthToken(process.env.AUTH_TOKEN) || crypto.randomUUID(),
     browsePort: parseInt(process.env.BROWSE_PORT || '0', 10),
     idleTimeoutMs: parseInt(process.env.BROWSE_IDLE_TIMEOUT || '1800000', 10),
     config: resolveConfig(),

@@ -53,12 +53,41 @@ describe('server.ts factory API surface', () => {
       }
     });
 
-    test('AUTH_TOKEN value is trimmed', () => {
+    test('AUTH_TOKEN whitespace is stripped (including unicode whitespace)', () => {
       const orig = process.env.AUTH_TOKEN;
-      process.env.AUTH_TOKEN = '  padded-token  ';
+      // 22 chars after stripping leading/trailing whitespace including BOM (U+FEFF)
+      // and zero-width space (U+200B), so passes the 16-char minimum.
+      process.env.AUTH_TOKEN = '﻿  padded-token-abc123xyz  ​';
       try {
         const cfg = resolveConfigFromEnv();
-        expect(cfg.authToken).toBe('padded-token');
+        expect(cfg.authToken).toBe('padded-token-abc123xyz');
+      } finally {
+        if (orig === undefined) delete process.env.AUTH_TOKEN;
+        else process.env.AUTH_TOKEN = orig;
+      }
+    });
+
+    test('AUTH_TOKEN shorter than 16 chars after stripping falls back to randomUUID', () => {
+      const orig = process.env.AUTH_TOKEN;
+      // Only 5 chars of content — too short for the 16-char minimum.
+      process.env.AUTH_TOKEN = 'short';
+      try {
+        const cfg = resolveConfigFromEnv();
+        // Must be a UUID, not the rejected short token.
+        expect(cfg.authToken).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+      } finally {
+        if (orig === undefined) delete process.env.AUTH_TOKEN;
+        else process.env.AUTH_TOKEN = orig;
+      }
+    });
+
+    test('AUTH_TOKEN of only zero-width unicode whitespace falls back to randomUUID', () => {
+      const orig = process.env.AUTH_TOKEN;
+      // U+200B (ZWSP), U+FEFF (BOM), U+00A0 (NBSP) — would pass .trim() but not the unicode-aware strip.
+      process.env.AUTH_TOKEN = '​﻿ ​';
+      try {
+        const cfg = resolveConfigFromEnv();
+        expect(cfg.authToken).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
       } finally {
         if (orig === undefined) delete process.env.AUTH_TOKEN;
         else process.env.AUTH_TOKEN = orig;
